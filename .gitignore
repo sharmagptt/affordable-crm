@@ -1,0 +1,7 @@
+.env
+crm.db
+crm.db-*
+backups/
+certs/
+__pycache__/
+*.pyc
