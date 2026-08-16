@@ -123,6 +123,17 @@ def assert_own_job(ctx, job_id):
         raise ApiError(403, "This task is not assigned to you")
 
 
+MIN_PIN_LENGTH = 4
+
+
+def clean_pin(value):
+    """PINs may be digits, letters or both — only the length is enforced."""
+    pin = str(value).strip()
+    if len(pin) < MIN_PIN_LENGTH:
+        raise ApiError(400, f"PIN must be at least {MIN_PIN_LENGTH} characters")
+    return pin
+
+
 def resolve_assignee(con, name):
     """Free-text assignee name -> (name, user_id or None).
 
@@ -712,10 +723,11 @@ def api_user_create(ctx):
         raise ApiError(400, "Role must be admin or staff")
     if con.execute("SELECT id FROM users WHERE LOWER(name) = LOWER(?)", (name,)).fetchone():
         raise ApiError(400, "A user with that name already exists")
+    pin = clean_pin(body["pin"])
     salt = db.new_salt()
     cur = con.execute(
         "INSERT INTO users (name, pin_hash, salt, role) VALUES (?, ?, ?, ?)",
-        (name, db.pin_hash(salt, str(body["pin"])), salt, role),
+        (name, db.pin_hash(salt, pin), salt, role),
     )
     # Jobs may already be assigned to this person by name from before they had a
     # login. Link those now, so their portal isn't empty on day one.
@@ -742,7 +754,7 @@ def api_user_update(ctx):
         if not body["active"]:
             db.delete_sessions_for_user(con, uid)
     if "pin" in body and str(body["pin"]).strip():
-        db.set_pin(con, uid, str(body["pin"]))
+        db.set_pin(con, uid, clean_pin(body["pin"]))
         db.delete_sessions_for_user(con, uid)  # PIN changed — log that user out everywhere
     if "role" in body:
         if body["role"] not in ("admin", "staff"):

@@ -52,6 +52,8 @@ const ICONS = {
   camera: '<path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/>',
   upload: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>',
   paperclip: '<path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>',
+  eye: '<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>',
+  eyeOff: '<path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/>',
 };
 function icon(name, size = 16) {
   return `<svg class="ic" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name]}</svg>`;
@@ -262,7 +264,11 @@ function renderLogin() {
       </div>
       <div id="pinBox" class="${selected ? "" : "hidden"}">
         ${err ? `<div class="login-err">${esc(err)}</div>` : ""}
-        <input id="pinInput" type="password" inputmode="numeric" autocomplete="off" placeholder="PIN">
+        <div class="pin-wrap">
+          <input id="pinInput" type="password" autocomplete="current-password"
+                 autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="PIN or password">
+          <button id="pinPeek" type="button" class="pin-peek" title="Show">${icon("eye", 18)}</button>
+        </div>
         <button id="loginBtn" class="btn btn-big">Login</button>
       </div>
     </div>`;
@@ -285,7 +291,16 @@ function renderLogin() {
     const loginBtn = view.querySelector("#loginBtn");
     if (loginBtn) {
       loginBtn.addEventListener("click", doLogin);
-      view.querySelector("#pinInput").addEventListener("keydown", (e) => { if (e.key === "Enter") doLogin(); });
+      const pinInput = view.querySelector("#pinInput");
+      pinInput.addEventListener("keydown", (e) => { if (e.key === "Enter") doLogin(); });
+      // letters are easy to mistype when they're masked — let people check
+      view.querySelector("#pinPeek").addEventListener("click", (e) => {
+        const showing = pinInput.type === "text";
+        pinInput.type = showing ? "password" : "text";
+        e.currentTarget.innerHTML = icon(showing ? "eye" : "eyeOff", 18);
+        e.currentTarget.title = showing ? "Show" : "Hide";
+        pinInput.focus();
+      });
     }
   };
   draw();
@@ -1281,7 +1296,8 @@ async function renderSettings() {
         </div>`).join("")}
       <div class="inline-form" style="margin-top:0.8rem">
         <label class="f">Name<input id="nuName"></label>
-        <label class="f">PIN<input id="nuPin" inputmode="numeric"></label>
+        <label class="f">PIN or password<input id="nuPin" type="text" autocapitalize="off"
+          autocorrect="off" spellcheck="false" placeholder="letters or numbers"></label>
         <label class="f">Role<select id="nuRole"><option value="staff">Staff</option><option value="admin">Admin</option></select></label>
         <button id="nuBtn" class="btn">+ Add user</button>
       </div>
@@ -1318,7 +1334,7 @@ async function renderSettings() {
   };
 
   view.querySelectorAll("[data-act='pin']").forEach((b) => b.addEventListener("click", async () => {
-    const pin = prompt(`New PIN for ${b.dataset.name}:`);
+    const pin = prompt(`New PIN or password for ${b.dataset.name}\n(letters and numbers both allowed, at least 4 characters):`);
     if (!pin || !pin.trim()) return;
     try { await api("/api/users/" + b.dataset.id, { method: "PATCH", body: { pin: pin.trim() } }); toast("PIN updated"); }
     catch (e) { toast(e.message, true); }
