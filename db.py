@@ -77,6 +77,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     created_at       TEXT NOT NULL,
     created_by       INTEGER REFERENCES users(id),
     assigned_name    TEXT NOT NULL DEFAULT '',
+    assigned_user_id INTEGER REFERENCES users(id),
     completed_at     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_client ON jobs(client_id);
@@ -92,6 +93,21 @@ CREATE TABLE IF NOT EXISTS payments (
 );
 CREATE INDEX IF NOT EXISTS idx_payments_job ON payments(job_id);
 
+-- Scans/photos of client paperwork. Stored in the database (not on disk)
+-- because cloud hosts wipe local files on every redeploy. Images are
+-- compressed in the browser before they get here.
+CREATE TABLE IF NOT EXISTS documents (
+    id          SERIAL PRIMARY KEY,
+    job_id      INTEGER NOT NULL REFERENCES jobs(id),
+    name        TEXT NOT NULL,
+    mime        TEXT NOT NULL,
+    size        INTEGER NOT NULL,
+    data        TEXT NOT NULL,
+    uploaded_by INTEGER REFERENCES users(id),
+    uploaded_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_documents_job ON documents(job_id);
+
 CREATE TABLE IF NOT EXISTS job_notes (
     id         SERIAL PRIMARY KEY,
     job_id     INTEGER NOT NULL REFERENCES jobs(id),
@@ -106,7 +122,7 @@ CREATE INDEX IF NOT EXISTS idx_job_notes_job ON job_notes(job_id);
 # Tables with a SERIAL "id" primary key — used to auto-add "RETURNING id" to
 # INSERT statements so callers can keep using sqlite-style cur.lastrowid.
 # "sessions" is deliberately excluded (its primary key is "token", not "id").
-_ID_TABLES = {"users", "clients", "service_types", "jobs", "payments", "job_notes"}
+_ID_TABLES = {"users", "clients", "service_types", "jobs", "payments", "job_notes", "documents"}
 
 
 # ---------------------------------------------------------------- config
@@ -165,6 +181,7 @@ class ResultProxy:
     def __init__(self, cur, lastrowid=None):
         self._cur = cur
         self.lastrowid = lastrowid
+        self.rowcount = cur.rowcount
         self._cols = tuple(d[0] for d in cur.description) if cur.description else ()
 
     def fetchone(self):
@@ -316,6 +333,17 @@ def cleanup_expired_sessions(con):
 def init():
     con = connect()
     con.executescript(SCHEMA)
+    # migration for databases created before the staff portal existed
+    # (must run after the CREATE TABLEs, and before anything that uses the column)
+    con.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS assigned_user_id INTEGER REFERENCES users(id)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_jobs_assigned_user ON jobs(assigned_user_id)")
+    # link any existing free-text assignee to a matching staff login
+    con.execute("""UPDATE jobs SET assigned_user_id = u.id
+                   FROM users u
+                   WHERE jobs.assigned_user_id IS NULL
+                     AND jobs.assigned_name <> ''
+                     AND LOWER(u.name) = LOWER(jobs.assigned_name)
+                     AND u.active = 1""")
     if con.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
         salt = new_salt()
         con.execute(
@@ -329,6 +357,11 @@ def init():
 
 
 BACKUP_TABLES = ["users", "clients", "service_types", "jobs", "payments", "job_notes", "sessions"]
+# documents are backed up as metadata only — including the file bytes would turn
+# a small JSON snapshot into hundreds of megabytes
+BACKUP_METADATA_ONLY = {
+    "documents": "SELECT id, job_id, name, mime, size, uploaded_by, uploaded_at FROM documents",
+}
 
 
 def backup():
@@ -344,6 +377,8 @@ def backup():
         for table in BACKUP_TABLES:
             rows = con.execute(f"SELECT * FROM {table}").fetchall()
             snapshot[table] = [dict(r) for r in rows]
+        for table, sql in BACKUP_METADATA_ONLY.items():
+            snapshot[table] = [dict(r) for r in con.execute(sql).fetchall()]
         with open(dest, "w", encoding="utf-8") as f:
             json.dump(snapshot, f, indent=2, default=str)
     finally:

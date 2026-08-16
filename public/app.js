@@ -49,6 +49,9 @@ const ICONS = {
   download: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>',
   pin: '<path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/>',
   arrow: '<line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/>',
+  camera: '<path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/>',
+  upload: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>',
+  paperclip: '<path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>',
 };
 function icon(name, size = 16) {
   return `<svg class="ic" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name]}</svg>`;
@@ -140,6 +143,17 @@ function assigneeDatalist(names) {
   return `<datalist id="assigneeDL">${names.map((n) => `<option value="${esc(n)}">`).join("")}</datalist>`;
 }
 
+/* Tells the admin whether the typed assignee actually has a staff login —
+   i.e. whether this task will show up in that person's portal. */
+function assigneeHint(name, logins) {
+  const n = (name || "").trim();
+  if (!n) return "";
+  const match = (logins || []).find((l) => l.toLowerCase() === n.toLowerCase());
+  return match
+    ? `<span class="paid-ok">${icon("check", 12)} ${esc(match)} has a login — this task will appear in their portal.</span>`
+    : `${icon("info", 12)} ${esc(n)} has no staff login, so this is just a label. Add them in Settings to give them a portal.`;
+}
+
 const AVATAR_COLORS = [
   ["#dbeafe", "#1e40af"], ["#dcfce7", "#166534"], ["#fef3c7", "#92400e"],
   ["#fce7f3", "#9d174d"], ["#ede9fe", "#5b21b6"], ["#cffafe", "#155e75"],
@@ -193,6 +207,10 @@ const pages = { tasks: renderTasks, clients: renderClients, client: renderClient
   job: renderJob, new: renderQuickAdd, payments: renderPayments, settings: renderSettings,
   invoice: renderInvoice };
 
+const isAdmin = () => boot.me && boot.me.role === "admin";
+/* pages a staff account may open — everything else is admin-only */
+const STAFF_PAGES = ["tasks", "job"];
+
 function route() {
   const topbar = document.getElementById("topbar");
   const bottomNav = document.getElementById("bottomNav");
@@ -206,8 +224,13 @@ function route() {
   bottomNav.classList.remove("hidden");
   document.getElementById("userName").textContent = boot.me.name;
 
+  // staff get a smaller app: only their tasks
+  document.querySelectorAll("[data-nav]").forEach((a) =>
+    a.classList.toggle("hidden", !isAdmin() && !STAFF_PAGES.includes(a.dataset.nav)));
+
   const parts = (location.hash || "#/tasks").slice(2).split("/");
-  const page = pages[parts[0]] ? parts[0] : "tasks";
+  let page = pages[parts[0]] ? parts[0] : "tasks";
+  if (!isAdmin() && !STAFF_PAGES.includes(page)) page = "tasks";
   document.querySelectorAll("[data-nav]").forEach((a) =>
     a.classList.toggle("active", a.dataset.nav === page ||
       (page === "client" && a.dataset.nav === "clients") ||
@@ -277,6 +300,7 @@ document.getElementById("logoutBtn").addEventListener("click", async () => {
 /* ---------------------------------------------------------- tasks */
 
 let tasksTab = "pending";
+let taskFilter = "all";   // admin-only: narrow the task list to one person
 
 async function renderTasks() {
   const d = await api("/api/tasks");
@@ -310,19 +334,49 @@ async function renderTasks() {
         : ""}</div>
     </div>`;
 
+  // admin can narrow the list to one person; staff already only get their own
+  const people = [...new Set([...d.pending, ...d.completed]
+    .map((j) => j.assigned_name).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+  const matchesFilter = (j) =>
+    taskFilter === "all" ? true
+      : taskFilter === "__none__" ? !j.assigned_name
+      : j.assigned_name === taskFilter;
+
   const draw = () => {
-    const list = tasksTab === "pending" ? d.pending : d.completed;
+    const all = tasksTab === "pending" ? d.pending : d.completed;
+    const list = isAdmin() ? all.filter(matchesFilter) : all;
+    const shown = (tab) => {
+      const src = tab === "pending" ? d.pending : d.completed;
+      return isAdmin() ? src.filter(matchesFilter).length : src.length;
+    };
     view.innerHTML = `
-      <div class="page-title">Tasks</div>
+      <div class="page-title">${isAdmin() ? "Tasks" : "My Tasks"}</div>
+      ${isAdmin() && people.length ? `
+      <div class="card" style="padding:0.7rem 1.15rem">
+        <label class="f" style="margin:0">Show tasks for
+          <select id="taskFilter">
+            <option value="all" ${taskFilter === "all" ? "selected" : ""}>Everyone</option>
+            ${people.map((p) => `<option value="${esc(p)}" ${taskFilter === p ? "selected" : ""}>${esc(p)}</option>`).join("")}
+            <option value="__none__" ${taskFilter === "__none__" ? "selected" : ""}>Nobody assigned</option>
+          </select>
+        </label>
+      </div>` : ""}
       <div class="tabs">
-        <button class="tab ${tasksTab === "pending" ? "active" : ""}" data-tab="pending">${icon("clock", 15)} Pending (${d.pending.length})</button>
-        <button class="tab ${tasksTab === "completed" ? "active" : ""}" data-tab="completed">${icon("checkCircle", 15)} Completed (${d.completed.length})</button>
+        <button class="tab ${tasksTab === "pending" ? "active" : ""}" data-tab="pending">${icon("clock", 15)} Pending (${shown("pending")})</button>
+        <button class="tab ${tasksTab === "completed" ? "active" : ""}" data-tab="completed">${icon("checkCircle", 15)} Completed (${shown("completed")})</button>
       </div>
       <div class="card">
         ${list.map(tasksTab === "pending" ? pendingRow : completedRow).join("")
-          || `<div class="empty">${tasksTab === "pending" ? "No pending tasks. Tap + New to add one." : "Nothing completed yet."}</div>`}
+          || `<div class="empty">${tasksTab === "pending"
+              ? (isAdmin() ? "No pending tasks. Tap + New Job to add one." : "Nothing pending — you're all caught up.")
+              : "Nothing completed yet."}</div>`}
       </div>`;
 
+    const filterSel = view.querySelector("#taskFilter");
+    if (filterSel) filterSel.addEventListener("change", (e) => {
+      taskFilter = e.target.value;
+      draw();
+    });
     view.querySelectorAll(".tab").forEach((b) => b.addEventListener("click", () => {
       tasksTab = b.dataset.tab;
       draw();
@@ -484,6 +538,7 @@ async function renderQuickAdd(prefillClientId) {
         <label class="f">Assigned to<input id="jAssign" list="assigneeDL" placeholder="Type a name" autocomplete="off"></label>
         <label class="f">Details<input id="jDetails" placeholder="e.g. Fresh passport for son, urgent"></label>
       </div>
+      <div id="jAssignHint" class="sub"></div>
     </div>
     <div class="card">
       <h3>3. Follow-up & advance</h3>
@@ -499,6 +554,7 @@ async function renderQuickAdd(prefillClientId) {
         <label class="f">Advance received (₹)<input id="jAdvance" inputmode="numeric" placeholder="0"></label>
       </div>
     </div>
+    ${stagedDocsCard()}
     <button id="saveJobBtn" class="btn btn-big">Save job</button>
     ${assigneeDatalist(asg.assignees)}`;
 
@@ -522,6 +578,15 @@ async function renderQuickAdd(prefillClientId) {
       <div class="sub">If this phone number matches an existing client, the job is added to their history automatically.</div>`;
   };
   drawPick();
+
+  const jAssign = view.querySelector("#jAssign");
+  const jAssignHint = view.querySelector("#jAssignHint");
+  jAssign.addEventListener("input", () => {
+    jAssignHint.innerHTML = assigneeHint(jAssign.value, asg.logins);
+  });
+
+  const stagedDocs = [];
+  wireStagedDocs(stagedDocs);
 
   view.querySelectorAll(".quick-dates button").forEach((b) =>
     b.addEventListener("click", (e) => {
@@ -549,10 +614,333 @@ async function renderQuickAdd(prefillClientId) {
       if (!name || !name.value.trim()) { toast("Enter the client's name", true); return; }
       body.new_client = { name: name.value, phone: phone.value };
     }
+    const saveBtn = view.querySelector("#saveJobBtn");
+    saveBtn.disabled = true;
     try {
       const d = await api("/api/jobs", { method: "POST", body });
-      toast("Job saved");
+      // the job exists now, so the files held in the browser can be attached
+      let failed = 0;
+      for (let i = 0; i < stagedDocs.length; i++) {
+        saveBtn.textContent = `Uploading document ${i + 1} of ${stagedDocs.length}…`;
+        try {
+          await uploadDocument(d.id, stagedDocs[i]);
+        } catch (_) { failed++; }
+      }
+      toast(failed
+        ? `Job saved, but ${failed} document(s) failed to upload`
+        : (stagedDocs.length ? `Job saved with ${stagedDocs.length} document(s)` : "Job saved"),
+        failed > 0);
       location.hash = "#/job/" + d.id;
+    } catch (e) {
+      toast(e.message, true);
+    } finally {
+      saveBtn.disabled = false;
+      saveBtn.textContent = "Save job";
+    }
+  });
+}
+
+/* ---------------------------------------------------------- documents */
+
+function fileSize(bytes) {
+  if (bytes < 1024) return bytes + " B";
+  if (bytes < 1024 * 1024) return Math.round(bytes / 1024) + " KB";
+  return (bytes / (1024 * 1024)).toFixed(1) + " MB";
+}
+
+/* Shrink photos before upload — a raw phone photo is several MB, which would
+   burn through the database's free storage in a few dozen documents. */
+async function compressImage(file, maxDim = 1600, quality = 0.72) {
+  try {
+    const bmp = await createImageBitmap(file);
+    const scale = Math.min(1, maxDim / Math.max(bmp.width, bmp.height));
+    const w = Math.round(bmp.width * scale);
+    const h = Math.round(bmp.height * scale);
+    const canvas = document.createElement("canvas");
+    canvas.width = w;
+    canvas.height = h;
+    canvas.getContext("2d").drawImage(bmp, 0, 0, w, h);
+    bmp.close();
+    const blob = await new Promise((res) => canvas.toBlob(res, "image/jpeg", quality));
+    // keep the original if compressing somehow made it bigger
+    return blob && blob.size < file.size ? blob : file;
+  } catch (_) {
+    return file; // unsupported format (e.g. HEIC on some browsers) — send as-is
+  }
+}
+
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result).split(",", 2)[1]);
+    r.onerror = () => reject(new Error("Could not read that file"));
+    r.readAsDataURL(blob);
+  });
+}
+
+async function uploadDocument(jobId, file, name) {
+  const isImage = file.type.startsWith("image/") && file.type !== "image/heic";
+  const payload = isImage ? await compressImage(file) : file;
+  if (payload.size > 10_000_000) throw new Error("That file is too large (max 10 MB)");
+  const data = await blobToBase64(payload);
+  return api(`/api/jobs/${jobId}/documents`, {
+    method: "POST",
+    body: {
+      name: name || file.name || "photo.jpg",
+      mime: isImage ? (payload === file ? file.type : "image/jpeg") : (file.type || "application/pdf"),
+      data,
+    },
+  });
+}
+
+/* Live camera capture. Needs a secure page (https or localhost) — the same
+   browser rule that applies to the microphone. */
+async function captureFromCamera() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    throw new Error("This browser cannot open the camera");
+  }
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 } },
+    audio: false,
+  });
+  return new Promise((resolve) => {
+    const overlay = document.createElement("div");
+    overlay.className = "cam-overlay";
+    overlay.innerHTML = `
+      <video autoplay playsinline></video>
+      <div class="cam-bar">
+        <button class="btn btn-ghost" data-cam="cancel">Cancel</button>
+        <button class="cam-shutter" data-cam="shoot" title="Take photo"></button>
+        <span style="width:5rem"></span>
+      </div>`;
+    document.body.appendChild(overlay);
+    const video = overlay.querySelector("video");
+    video.srcObject = stream;
+    const close = (result) => {
+      stream.getTracks().forEach((t) => t.stop());
+      overlay.remove();
+      resolve(result);
+    };
+    overlay.querySelector('[data-cam="cancel"]').addEventListener("click", () => close(null));
+    overlay.querySelector('[data-cam="shoot"]').addEventListener("click", () => {
+      const canvas = document.createElement("canvas");
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      canvas.getContext("2d").drawImage(video, 0, 0);
+      canvas.toBlob((blob) => {
+        close(new File([blob], `photo-${Date.now()}.jpg`, { type: "image/jpeg" }));
+      }, "image/jpeg", 0.85);
+    });
+  });
+}
+
+const canCaptureLive = () =>
+  !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia) && window.isSecureContext;
+
+/* Attach documents while the job is still being typed in. The job doesn't exist
+   yet, so files are held in the browser and uploaded right after it's created. */
+function stagedDocsCard() {
+  return `
+    <div class="card">
+      <h3>${icon("paperclip")} Documents <span class="count" id="sdCount">0</span></h3>
+      <div class="inline-form" style="margin-bottom:0.8rem">
+        <button id="sdCamBtn" class="btn" ${canCaptureLive() ? "" : "disabled"}>${icon("camera", 15)} Take photo</button>
+        <button id="sdFileBtn" class="btn btn-light">${icon("upload", 15)} Choose file</button>
+        <input id="sdFileInput" type="file" accept="image/*,application/pdf" multiple class="hidden">
+      </div>
+      ${canCaptureLive() ? "" : `<div class="sub" style="margin-bottom:0.6rem">${icon("info", 12)} Live camera needs a secure (https) address — "Choose file" still works, and on a phone it offers the camera.</div>`}
+      <div class="doc-grid" id="sdGrid"></div>
+      <div class="sub" id="sdHint" style="margin-top:0.5rem">Photos are shrunk automatically. They upload when you save the job.</div>
+    </div>`;
+}
+
+function wireStagedDocs(staged) {
+  const grid = view.querySelector("#sdGrid");
+  const countEl = view.querySelector("#sdCount");
+  const fileInput = view.querySelector("#sdFileInput");
+
+  const draw = () => {
+    countEl.textContent = staged.length;
+    grid.innerHTML = staged.map((f, i) => `
+      <div class="doc">
+        ${f.type.startsWith("image/")
+          ? `<img src="${URL.createObjectURL(f)}" alt="${esc(f.name)}">`
+          : `<div class="doc-file">${icon("file", 26)}<span>PDF</span></div>`}
+        <div class="doc-meta">
+          <div class="doc-name" title="${esc(f.name)}">${esc(f.name)}</div>
+          <div class="sub">${fileSize(f.size)}</div>
+        </div>
+        <button class="x-btn" data-unstage="${i}" title="Remove">✕</button>
+      </div>`).join("");
+    grid.querySelectorAll("[data-unstage]").forEach((b) =>
+      b.addEventListener("click", () => {
+        staged.splice(Number(b.dataset.unstage), 1);
+        draw();
+      }));
+  };
+  draw();
+
+  view.querySelector("#sdFileBtn").addEventListener("click", () => fileInput.click());
+  fileInput.addEventListener("change", (e) => {
+    staged.push(...e.target.files);
+    fileInput.value = "";
+    draw();
+  });
+  const cam = view.querySelector("#sdCamBtn");
+  if (cam && !cam.disabled) {
+    cam.addEventListener("click", async () => {
+      try {
+        const shot = await captureFromCamera();
+        if (shot) { staged.push(shot); draw(); }
+      } catch (e) {
+        toast(e.name === "NotAllowedError" ? "Camera permission was blocked" : e.message, true);
+      }
+    });
+  }
+}
+
+function documentsCard(docs, readOnly = false) {
+  const canCapture = canCaptureLive();
+  return `
+    <div class="card">
+      <h3>${icon("paperclip")} Documents <span class="count">${docs.length}</span></h3>
+      ${readOnly ? "" : `
+      <div class="inline-form" style="margin-bottom:0.8rem">
+        <button id="docCamBtn" class="btn" ${canCapture ? "" : "disabled"}>${icon("camera", 15)} Take photo</button>
+        <button id="docFileBtn" class="btn btn-light">${icon("upload", 15)} Choose file</button>
+        <input id="docFileInput" type="file" accept="image/*,application/pdf" multiple class="hidden">
+        <span id="docStatus" class="sub"></span>
+      </div>
+      ${canCapture ? "" : `<div class="sub" style="margin-bottom:0.6rem">${icon("info", 12)} Live camera needs a secure (https) address — "Choose file" still works, and on a phone it offers the camera.</div>`}`}
+      <div class="doc-grid">
+        ${docs.map((d) => `
+          <div class="doc">
+            <a href="/api/documents/${d.id}" target="_blank" rel="noopener" title="${esc(d.name)}">
+              ${d.mime.startsWith("image/")
+                ? `<img src="/api/documents/${d.id}" alt="${esc(d.name)}" loading="lazy">`
+                : `<div class="doc-file">${icon("file", 26)}<span>PDF</span></div>`}
+            </a>
+            <div class="doc-meta">
+              <div class="doc-name" title="${esc(d.name)}">${esc(d.name)}</div>
+              <div class="sub">${fileSize(d.size)}${d.uploaded_by_name ? " · " + esc(d.uploaded_by_name) : ""}</div>
+            </div>
+            ${readOnly ? "" : `<button class="x-btn" data-deldoc="${d.id}" title="Delete this document">✕</button>`}
+          </div>`).join("") || '<div class="empty">No documents yet.</div>'}
+      </div>
+    </div>`;
+}
+
+function wireDocuments(jobId, reload) {
+  const statusEl = view.querySelector("#docStatus");
+  const fileInput = view.querySelector("#docFileInput");
+  const send = async (files) => {
+    let done = 0;
+    for (const f of files) {
+      statusEl.textContent = `Uploading ${++done} of ${files.length}…`;
+      try {
+        await uploadDocument(jobId, f);
+      } catch (e) {
+        toast(e.message, true);
+        statusEl.textContent = "";
+        return;
+      }
+    }
+    statusEl.textContent = "";
+    toast(files.length > 1 ? `${files.length} documents added` : "Document added");
+    reload();
+  };
+
+  view.querySelector("#docFileBtn").addEventListener("click", () => fileInput.click());
+  fileInput.addEventListener("change", (e) => {
+    const files = [...e.target.files];
+    if (files.length) send(files);
+  });
+
+  const camBtn = view.querySelector("#docCamBtn");
+  if (camBtn && !camBtn.disabled) {
+    camBtn.addEventListener("click", async () => {
+      try {
+        const shot = await captureFromCamera();
+        if (shot) send([shot]);
+      } catch (e) {
+        toast(e.name === "NotAllowedError" ? "Camera permission was blocked" : e.message, true);
+      }
+    });
+  }
+
+  view.querySelectorAll("[data-deldoc]").forEach((b) => b.addEventListener("click", async () => {
+    if (!confirm("Delete this document permanently?")) return;
+    try {
+      await api("/api/documents/" + b.dataset.deldoc, { method: "DELETE" });
+      toast("Document deleted");
+      reload();
+    } catch (e) { toast(e.message, true); }
+  }));
+}
+
+/* ---------------------------------------------------------- staff task view */
+
+/* What a staff member sees for one of their tasks: the client to contact, what
+   to do, and a place to record what happened. No money, no editing, no delete. */
+function renderStaffJob(id, d, j, kindIcon, documents = []) {
+  view.innerHTML = `
+    <a class="back" href="#/tasks">← My Tasks</a>
+    <div class="card">
+      <div class="job-head">
+        <h2>${esc(j.service_name)}</h2>
+        ${j.status !== "Pending" ? chip(j.status) : ""}
+        <div class="spacer"></div>
+        ${j.status === "Pending"
+          ? `<button id="doneBtn" class="btn btn-green">${icon("check", 15)} Mark as done</button>`
+          : `<button id="reopenBtn" class="btn btn-light">${icon("rotate", 13)} Reopen</button>`}
+      </div>
+      <div class="row" style="cursor:default">
+        ${avatar(j.client_name)}
+        <div class="grow">
+          <div class="title">${esc(j.client_name)}</div>
+          <div class="sub">${phoneLink(j.client_phone)}</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>${icon("arrow")} What to do</h3>
+      <div style="font-size:1.08rem;font-weight:600">${esc(j.next_action) || '<span class="sub">No specific action noted</span>'}</div>
+      ${j.next_action_date ? `<div style="margin-top:0.4rem">${dateTag(j.next_action_date)}</div>` : ""}
+      ${j.details ? `<div class="sub" style="margin-top:0.6rem">${esc(j.details)}</div>` : ""}
+    </div>
+
+    ${documentsCard(documents, true)}
+
+    <div class="card">
+      <h3>${icon("clock")} Notes</h3>
+      <div class="inline-form" style="margin-bottom:0.6rem">
+        <label class="f">Add a note<input id="noteText" placeholder="e.g. Client will come Saturday"></label>
+        <button id="noteBtn" class="btn">Add</button>
+      </div>
+      <ul class="tl">
+        ${d.timeline.map((n) => `
+          <li><span class="k">${kindIcon[n.kind] || icon("note", 15)}</span>
+            <div><div>${esc(n.text)}</div>
+            <div class="when">${esc(n.user_name || "")} · ${fmtDateTime(n.created_at)}</div></div>
+          </li>`).join("") || '<li class="empty">Nothing yet.</li>'}
+      </ul>
+    </div>`;
+
+  const patch = async (body, msg) => {
+    try { await api("/api/jobs/" + id, { method: "PATCH", body }); toast(msg); renderJob(id); }
+    catch (e) { toast(e.message, true); }
+  };
+  const doneBtn = view.querySelector("#doneBtn");
+  if (doneBtn) doneBtn.addEventListener("click", () => patch({ status: "Completed" }, "Marked as done"));
+  const reopenBtn = view.querySelector("#reopenBtn");
+  if (reopenBtn) reopenBtn.addEventListener("click", () => patch({ status: "Pending" }, "Moved back to pending"));
+  view.querySelector("#noteBtn").addEventListener("click", async () => {
+    const text = view.querySelector("#noteText").value.trim();
+    if (!text) return;
+    try {
+      await api(`/api/jobs/${id}/notes`, { method: "POST", body: { text } });
+      renderJob(id);
     } catch (e) { toast(e.message, true); }
   });
 }
@@ -560,10 +948,17 @@ async function renderQuickAdd(prefillClientId) {
 /* ---------------------------------------------------------- job page */
 
 async function renderJob(id) {
-  const [d, asg] = await Promise.all([api("/api/jobs/" + id), api("/api/assignees")]);
+  // the assignee list is admin-only; documents are visible to whoever owns the task
+  const [d, asg, docs] = await Promise.all([
+    api("/api/jobs/" + id),
+    isAdmin() ? api("/api/assignees") : Promise.resolve({ assignees: [], logins: [] }),
+    api(`/api/jobs/${id}/documents`),
+  ]);
   const j = d.job;
   const kindIcon = { note: icon("note", 15), status: icon("swap", 15),
     payment: icon("banknote", 15), system: icon("info", 15) };
+
+  if (!isAdmin()) return renderStaffJob(id, d, j, kindIcon, docs.documents);
 
   view.innerHTML = `
     <a class="back" href="javascript:history.back()">← Back</a>
@@ -592,6 +987,7 @@ async function renderJob(id) {
           <input id="assignInp" list="assigneeDL" value="${esc(j.assigned_name)}" placeholder="Type a name…" autocomplete="off">
         </label>
       </div>
+      <div id="assignHint" class="sub" style="margin-top:0.3rem"></div>
       ${assigneeDatalist(asg.assignees)}
       <div class="sub" style="margin-top:0.5rem">Started ${fmtDateTime(j.created_at)}${j.completed_at ? " · Completed " + fmtDateTime(j.completed_at) : ""}</div>
     </div>
@@ -641,6 +1037,8 @@ async function renderJob(id) {
       <button id="detailsBtn" class="btn btn-light btn-sm">Save details</button>
     </div>
 
+    ${documentsCard(docs.documents)}
+
     <div class="card">
       <h3>${icon("clock")} History & notes</h3>
       <div class="inline-form" style="margin-bottom:0.6rem">
@@ -673,7 +1071,14 @@ async function renderJob(id) {
   });
   const reopenBtn = view.querySelector("#reopenBtn");
   if (reopenBtn) reopenBtn.addEventListener("click", () => patch({ status: "Pending" }, "Moved back to Pending"));
-  view.querySelector("#assignInp").addEventListener("change", (e) =>
+  const assignInp = view.querySelector("#assignInp");
+  const assignHint = view.querySelector("#assignHint");
+  const drawAssignHint = () => {
+    assignHint.innerHTML = assigneeHint(assignInp.value, asg.logins);
+  };
+  drawAssignHint();
+  assignInp.addEventListener("input", drawAssignHint);
+  assignInp.addEventListener("change", (e) =>
     patch({ assigned_name: e.target.value.trim() }, "Assignee updated"));
   view.querySelector("#delJobBtn").addEventListener("click", async () => {
     if (!confirm("Delete this job permanently?\nAll its payments and history will be deleted too. This cannot be undone.")) return;
@@ -698,6 +1103,7 @@ async function renderJob(id) {
       renderJob(id);
     } catch (e) { toast(e.message, true); }
   }));
+  wireDocuments(id, () => renderJob(id));
   view.querySelector("#naSave").addEventListener("click", () =>
     patch({ next_action: view.querySelector("#naText").value,
             next_action_date: view.querySelector("#naDate").value }, "Follow-up saved"));
@@ -856,7 +1262,9 @@ async function renderSettings() {
     return;
   }
 
-  const [ud, sd] = await Promise.all([api("/api/users"), api("/api/service_types")]);
+  const [ud, sd, st] = await Promise.all([
+    api("/api/users"), api("/api/service_types"), api("/api/storage")]);
+  const usedPct = Math.min(100, (st.bytes / st.limit_bytes) * 100);
 
   view.innerHTML = `
     <div class="page-title">Settings</div>
@@ -891,8 +1299,16 @@ async function renderSettings() {
       </div>
     </div>
     <div class="card">
+      <h3>${icon("paperclip")} Document storage</h3>
+      <p class="sub" style="margin-bottom:0.5rem">
+        <b>${st.documents}</b> document(s) using <b>${fileSize(st.bytes)}</b> of ${fileSize(st.limit_bytes)}.
+      </p>
+      <div class="meter"><span style="width:${usedPct.toFixed(1)}%"></span></div>
+      <p class="sub" style="margin-top:0.5rem">Photos are automatically shrunk before saving, so roughly 1,500–2,500 documents fit in the free plan. Delete old ones from a job if this ever fills up.</p>
+    </div>
+    <div class="card">
       <h3>${icon("download")} Backup</h3>
-      <p class="sub" style="margin-bottom:0.7rem">Saves a safe copy of all data into the <b>backups</b> folder next to the app. Do this regularly — and occasionally copy that folder to a pen drive or Google Drive.</p>
+      <p class="sub" style="margin-bottom:0.7rem">Saves a safe copy of all data into the <b>backups</b> folder next to the app. Do this regularly — and occasionally copy that folder to a pen drive or Google Drive. (Document files themselves are not included — only their details.)</p>
       <button id="backupBtn" class="btn">Backup now</button>
     </div>`;
 
@@ -915,12 +1331,15 @@ async function renderSettings() {
   }));
   view.querySelector("#nuBtn").addEventListener("click", async () => {
     try {
-      await api("/api/users", { method: "POST", body: {
+      const r = await api("/api/users", { method: "POST", body: {
         name: view.querySelector("#nuName").value,
         pin: view.querySelector("#nuPin").value,
         role: view.querySelector("#nuRole").value,
       }});
-      toast("User added"); refresh();
+      toast(r.adopted_jobs
+        ? `User added — ${r.adopted_jobs} existing task(s) moved into their portal`
+        : "User added");
+      refresh();
     } catch (e) { toast(e.message, true); }
   });
   view.querySelectorAll("[data-sact='toggle']").forEach((b) => b.addEventListener("click", async () => {

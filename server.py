@@ -3,6 +3,8 @@
 Run:  py server.py          (opens the browser automatically)
       py server.py --no-browser
 """
+import base64
+import binascii
 import json
 import os
 import re
@@ -23,6 +25,11 @@ PUBLIC_DIR = os.path.join(db.BASE_DIR, "public")
 
 ROUTES = []    # (method, compiled regex, handler, needs_auth, needs_admin)
 
+# uploads arrive base64-encoded inside JSON, which inflates them by ~33%
+MAX_BODY_BYTES = 15_000_000
+MAX_FILE_BYTES = 10_000_000
+ALLOWED_UPLOAD_MIME = ("image/jpeg", "image/png", "image/webp", "image/heic", "application/pdf")
+
 MIME = {
     ".html": "text/html; charset=utf-8",
     ".css": "text/css; charset=utf-8",
@@ -39,6 +46,15 @@ class ApiError(Exception):
         super().__init__(message)
         self.status = status
         self.message = message
+
+
+class RawResponse:
+    """Return this from a handler to send bytes instead of JSON (file downloads)."""
+
+    def __init__(self, content, mime, filename=None):
+        self.content = content
+        self.mime = mime
+        self.filename = filename
 
 
 def route(method, pattern, auth=True, admin=False):
@@ -74,6 +90,51 @@ def job_row_dict(row):
     d = dict(row)
     d["balance"] = d.get("amount_quoted", 0) - d.get("paid", 0)
     return d
+
+
+# ---- staff-portal access control -------------------------------------------
+# Staff accounts see only the jobs assigned to them, and never see money.
+# These checks run on every request; hiding things in the browser is not enough.
+
+MONEY_FIELDS = ("amount_quoted", "paid", "balance")
+
+
+def is_admin(user):
+    return bool(user) and user["role"] == "admin"
+
+
+def strip_money(d):
+    return {k: v for k, v in d.items() if k not in MONEY_FIELDS}
+
+
+def visible_job(d, user):
+    """A job dict as this user is allowed to see it."""
+    return d if is_admin(user) else strip_money(d)
+
+
+def assert_own_job(ctx, job_id):
+    """Staff may only read or touch jobs assigned to them."""
+    user = ctx["user"]
+    if is_admin(user):
+        return
+    row = ctx["con"].execute(
+        "SELECT assigned_user_id FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    if not row or row["assigned_user_id"] != user["id"]:
+        raise ApiError(403, "This task is not assigned to you")
+
+
+def resolve_assignee(con, name):
+    """Free-text assignee name -> (name, user_id or None).
+
+    Typing a name that matches an active login links the job to that account,
+    so it shows up in that person's portal. Any other name still works as a
+    plain label (for helpers who have no login)."""
+    name = (name or "").strip()
+    if not name:
+        return "", None
+    row = con.execute(
+        "SELECT id FROM users WHERE LOWER(name) = LOWER(?) AND active = 1", (name,)).fetchone()
+    return name, (row["id"] if row else None)
 
 
 def fetch_job_full(con, job_id):
@@ -162,7 +223,7 @@ def api_bootstrap(ctx):
 
 @route("GET", "/api/tasks")
 def api_tasks(ctx):
-    con = ctx["con"]
+    con, user = ctx["con"], ctx["user"]
     base = """SELECT j.id, j.client_id, j.status, j.next_action, j.next_action_date,
                      j.amount_quoted, j.details, j.completed_at, j.created_at, j.assigned_name,
                      c.name AS client_name, c.phone AS client_phone,
@@ -171,22 +232,31 @@ def api_tasks(ctx):
               FROM jobs j
               JOIN clients c ON c.id = j.client_id
               JOIN service_types s ON s.id = j.service_type_id """
+    # staff only ever get their own tasks — enforced here, not in the browser
+    scope, args = "", []
+    if not is_admin(user):
+        scope = " AND j.assigned_user_id = ?"
+        args = [user["id"]]
+
     # dated tasks first (oldest date on top, so overdue leads), undated last
     pending = [job_row_dict(r) for r in con.execute(
-        base + """WHERE j.status NOT IN ('Completed', 'Cancelled')
-                  ORDER BY CASE WHEN j.next_action_date = '' THEN 1 ELSE 0 END,
-                           j.next_action_date"""
+        base + "WHERE j.status NOT IN ('Completed', 'Cancelled')" + scope +
+        """ ORDER BY CASE WHEN j.next_action_date = '' THEN 1 ELSE 0 END,
+                    j.next_action_date""", args
     ).fetchall()]
     completed = [job_row_dict(r) for r in con.execute(
-        base + """WHERE j.status IN ('Completed', 'Cancelled')
-                  ORDER BY COALESCE(j.completed_at, j.created_at) DESC LIMIT 100"""
+        base + "WHERE j.status IN ('Completed', 'Cancelled')" + scope +
+        " ORDER BY COALESCE(j.completed_at, j.created_at) DESC LIMIT 100", args
     ).fetchall()]
-    return {"pending": pending, "completed": completed}
+    return {
+        "pending": [visible_job(j, user) for j in pending],
+        "completed": [visible_job(j, user) for j in completed],
+    }
 
 
 # ---------------------------------------------------------------- clients
 
-@route("GET", "/api/clients")
+@route("GET", "/api/clients", admin=True)
 def api_clients(ctx):
     q = (ctx["query"].get("q", [""])[0] or "").strip()
     con = ctx["con"]
@@ -204,7 +274,7 @@ def api_clients(ctx):
     return {"clients": [dict(r) for r in con.execute(sql, args)]}
 
 
-@route("POST", "/api/clients")
+@route("POST", "/api/clients", admin=True)
 def api_client_create(ctx):
     body, con = ctx["body"], ctx["con"]
     require(body, "name")
@@ -219,7 +289,7 @@ def api_client_create(ctx):
     return {"id": cur.lastrowid}
 
 
-@route("GET", "/api/clients/{id}")
+@route("GET", "/api/clients/{id}", admin=True)
 def api_client_get(ctx):
     con = ctx["con"]
     cid = int(ctx["params"]["id"])
@@ -236,7 +306,7 @@ def api_client_get(ctx):
     return {"client": dict(client), "jobs": jobs}
 
 
-@route("PATCH", "/api/clients/{id}")
+@route("PATCH", "/api/clients/{id}", admin=True)
 def api_client_update(ctx):
     con, body = ctx["con"], ctx["body"]
     cid = int(ctx["params"]["id"])
@@ -259,7 +329,7 @@ def api_client_update(ctx):
 
 # ---------------------------------------------------------------- jobs
 
-@route("POST", "/api/jobs")
+@route("POST", "/api/jobs", admin=True)
 def api_job_create(ctx):
     body, con, user = ctx["body"], ctx["con"], ctx["user"]
     require(body, "service_type_id")
@@ -293,14 +363,15 @@ def api_job_create(ctx):
         raise ApiError(404, "Service type not found")
 
     amount = as_int(body.get("amount_quoted") or 0, "amount_quoted", minimum=0)
-    assigned_name = str(body.get("assigned_name", "")).strip()
+    assigned_name, assigned_user_id = resolve_assignee(con, body.get("assigned_name", ""))
     cur = con.execute(
         """INSERT INTO jobs (client_id, service_type_id, details, status, next_action,
-                             next_action_date, amount_quoted, created_at, created_by, assigned_name)
-           VALUES (?, ?, ?, 'Pending', ?, ?, ?, ?, ?, ?)""",
+                             next_action_date, amount_quoted, created_at, created_by,
+                             assigned_name, assigned_user_id)
+           VALUES (?, ?, ?, 'Pending', ?, ?, ?, ?, ?, ?, ?)""",
         (client_id, service_id, body.get("details", "").strip(),
          body.get("next_action", "").strip(), body.get("next_action_date", "").strip(),
-         amount, db.now(), user["id"], assigned_name),
+         amount, db.now(), user["id"], assigned_name, assigned_user_id),
     )
     job_id = cur.lastrowid
     created_note = "Job created" + (f" · assigned to {assigned_name}" if assigned_name else "")
@@ -321,19 +392,27 @@ def api_job_create(ctx):
 
 @route("GET", "/api/jobs/{id}")
 def api_job_get(ctx):
-    con = ctx["con"]
+    con, user = ctx["con"], ctx["user"]
     job_id = int(ctx["params"]["id"])
+    assert_own_job(ctx, job_id)
     job = fetch_job_full(con, job_id)
-    payments = [dict(r) for r in con.execute(
-        """SELECT p.*, u.name AS received_by_name
-           FROM payments p LEFT JOIN users u ON u.id = p.received_by
-           WHERE p.job_id = ? ORDER BY p.id DESC""",
-        (job_id,),
-    )]
     timeline = [dict(r) for r in con.execute(
         """SELECT n.*, u.name AS user_name
            FROM job_notes n LEFT JOIN users u ON u.id = n.user_id
            WHERE n.job_id = ? ORDER BY n.id DESC""",
+        (job_id,),
+    )]
+    if not is_admin(user):
+        # payment history is money too — keep it out of the staff portal entirely
+        return {
+            "job": visible_job(job, user),
+            "payments": [],
+            "timeline": [n for n in timeline if n["kind"] != "payment"],
+        }
+    payments = [dict(r) for r in con.execute(
+        """SELECT p.*, u.name AS received_by_name
+           FROM payments p LEFT JOIN users u ON u.id = p.received_by
+           WHERE p.job_id = ? ORDER BY p.id DESC""",
         (job_id,),
     )]
     return {"job": job, "payments": payments, "timeline": timeline}
@@ -343,9 +422,12 @@ def api_job_get(ctx):
 def api_job_update(ctx):
     con, body, user = ctx["con"], ctx["body"], ctx["user"]
     job_id = int(ctx["params"]["id"])
+    assert_own_job(ctx, job_id)
     job = con.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
     if not job:
         raise ApiError(404, "Job not found")
+    if not is_admin(user) and set(body) - {"status"}:
+        raise ApiError(403, "You can only mark a task as done or reopen it")
 
     sets, args = [], []
     if "status" in body:
@@ -361,10 +443,12 @@ def api_job_update(ctx):
                      "Pending": "Reopened"}.get(status, f"Status: {status}")
             add_timeline(con, job_id, "status", label, user)
     if "assigned_name" in body:
-        name = str(body["assigned_name"]).strip()
+        name, assigned_user_id = resolve_assignee(con, body["assigned_name"])
         if name != job["assigned_name"]:
             sets.append("assigned_name = ?")
             args.append(name)
+            sets.append("assigned_user_id = ?")
+            args.append(assigned_user_id)
             add_timeline(con, job_id, "status",
                          f"Assigned to {name}" if name else "Assignment removed", user)
     if "next_action" in body:
@@ -389,7 +473,7 @@ def api_job_update(ctx):
         args.append(job_id)
         con.execute(f"UPDATE jobs SET {', '.join(sets)} WHERE id = ?", args)
         con.commit()
-    return fetch_job_full(con, job_id)
+    return visible_job(fetch_job_full(con, job_id), user)
 
 
 @route("POST", "/api/jobs/{id}/notes")
@@ -397,6 +481,7 @@ def api_job_note(ctx):
     con, body, user = ctx["con"], ctx["body"], ctx["user"]
     job_id = int(ctx["params"]["id"])
     require(body, "text")
+    assert_own_job(ctx, job_id)
     if not con.execute("SELECT id FROM jobs WHERE id = ?", (job_id,)).fetchone():
         raise ApiError(404, "Job not found")
     add_timeline(con, job_id, "note", body["text"].strip(), user)
@@ -404,7 +489,7 @@ def api_job_note(ctx):
     return {"ok": True}
 
 
-@route("POST", "/api/jobs/{id}/payments")
+@route("POST", "/api/jobs/{id}/payments", admin=True)
 def api_job_payment(ctx):
     con, body, user = ctx["con"], ctx["body"], ctx["user"]
     job_id = int(ctx["params"]["id"])
@@ -421,7 +506,7 @@ def api_job_payment(ctx):
     return {"ok": True}
 
 
-@route("DELETE", "/api/jobs/{id}")
+@route("DELETE", "/api/jobs/{id}", admin=True)
 def api_job_delete(ctx):
     con = ctx["con"]
     job_id = int(ctx["params"]["id"])
@@ -429,12 +514,13 @@ def api_job_delete(ctx):
         raise ApiError(404, "Job not found")
     con.execute("DELETE FROM payments WHERE job_id = ?", (job_id,))
     con.execute("DELETE FROM job_notes WHERE job_id = ?", (job_id,))
+    con.execute("DELETE FROM documents WHERE job_id = ?", (job_id,))
     con.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
     con.commit()
     return {"ok": True}
 
 
-@route("DELETE", "/api/clients/{id}")
+@route("DELETE", "/api/clients/{id}", admin=True)
 def api_client_delete(ctx):
     con = ctx["con"]
     cid = int(ctx["params"]["id"])
@@ -442,13 +528,14 @@ def api_client_delete(ctx):
         raise ApiError(404, "Client not found")
     con.execute("DELETE FROM payments WHERE job_id IN (SELECT id FROM jobs WHERE client_id = ?)", (cid,))
     con.execute("DELETE FROM job_notes WHERE job_id IN (SELECT id FROM jobs WHERE client_id = ?)", (cid,))
+    con.execute("DELETE FROM documents WHERE job_id IN (SELECT id FROM jobs WHERE client_id = ?)", (cid,))
     con.execute("DELETE FROM jobs WHERE client_id = ?", (cid,))
     con.execute("DELETE FROM clients WHERE id = ?", (cid,))
     con.commit()
     return {"ok": True}
 
 
-@route("DELETE", "/api/payments/{id}")
+@route("DELETE", "/api/payments/{id}", admin=True)
 def api_payment_delete(ctx):
     con, user = ctx["con"], ctx["user"]
     pid = int(ctx["params"]["id"])
@@ -461,7 +548,7 @@ def api_payment_delete(ctx):
     return {"ok": True}
 
 
-@route("DELETE", "/api/notes/{id}")
+@route("DELETE", "/api/notes/{id}", admin=True)
 def api_note_delete(ctx):
     con = ctx["con"]
     nid = int(ctx["params"]["id"])
@@ -472,19 +559,104 @@ def api_note_delete(ctx):
     return {"ok": True}
 
 
-@route("GET", "/api/assignees")
+# ---------------------------------------------------------------- documents
+
+@route("GET", "/api/jobs/{id}/documents")
+def api_documents_list(ctx):
+    job_id = int(ctx["params"]["id"])
+    assert_own_job(ctx, job_id)   # staff may only see documents on their own tasks
+    rows = ctx["con"].execute(
+        """SELECT d.id, d.name, d.mime, d.size, d.uploaded_at, u.name AS uploaded_by_name
+           FROM documents d LEFT JOIN users u ON u.id = d.uploaded_by
+           WHERE d.job_id = ? ORDER BY d.id DESC""",
+        (job_id,),
+    ).fetchall()
+    return {"documents": [dict(r) for r in rows]}
+
+
+@route("POST", "/api/jobs/{id}/documents", admin=True)
+def api_document_upload(ctx):
+    con, body, user = ctx["con"], ctx["body"], ctx["user"]
+    job_id = int(ctx["params"]["id"])
+    if not con.execute("SELECT id FROM jobs WHERE id = ?", (job_id,)).fetchone():
+        raise ApiError(404, "Job not found")
+    require(body, "name", "mime", "data")
+    mime = str(body["mime"]).split(";")[0].strip().lower()
+    if mime not in ALLOWED_UPLOAD_MIME:
+        raise ApiError(400, "Only photos and PDF files can be uploaded")
+    data = str(body["data"])
+    if "," in data[:64] and data.lstrip().startswith("data:"):
+        data = data.split(",", 1)[1]          # tolerate a full data: URL
+    try:
+        size = len(base64.b64decode(data, validate=True))
+    except (ValueError, binascii.Error):
+        raise ApiError(400, "That file could not be read")
+    if size == 0:
+        raise ApiError(400, "That file is empty")
+    if size > MAX_FILE_BYTES:
+        raise ApiError(413, "That file is too large")
+    cur = con.execute(
+        """INSERT INTO documents (job_id, name, mime, size, data, uploaded_by, uploaded_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (job_id, str(body["name"])[:200].strip() or "document", mime, size, data,
+         user["id"], db.now()),
+    )
+    add_timeline(con, job_id, "system", f"Document added: {str(body['name'])[:100]}", user)
+    con.commit()
+    return {"id": cur.lastrowid, "size": size}
+
+
+@route("GET", "/api/documents/{id}")
+def api_document_get(ctx):
+    row = ctx["con"].execute(
+        "SELECT job_id, name, mime, data FROM documents WHERE id = ?",
+        (int(ctx["params"]["id"]),)).fetchone()
+    if not row:
+        raise ApiError(404, "Document not found")
+    assert_own_job(ctx, row["job_id"])   # staff may only open their own task's files
+    try:
+        content = base64.b64decode(row["data"])
+    except (ValueError, binascii.Error):
+        raise ApiError(500, "That document is corrupted")
+    return RawResponse(content, row["mime"], row["name"])
+
+
+@route("DELETE", "/api/documents/{id}", admin=True)
+def api_document_delete(ctx):
+    con, user = ctx["con"], ctx["user"]
+    doc_id = int(ctx["params"]["id"])
+    row = con.execute("SELECT job_id, name FROM documents WHERE id = ?", (doc_id,)).fetchone()
+    if not row:
+        raise ApiError(404, "Document not found")
+    con.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
+    add_timeline(con, row["job_id"], "system", f"Document deleted: {row['name']}", user)
+    con.commit()
+    return {"ok": True}
+
+
+@route("GET", "/api/storage", admin=True)
+def api_storage(ctx):
+    row = ctx["con"].execute(
+        "SELECT COUNT(*) AS n, COALESCE(SUM(size), 0) AS bytes FROM documents").fetchone()
+    return {"documents": row["n"], "bytes": row["bytes"], "limit_bytes": 500 * 1024 * 1024}
+
+
+@route("GET", "/api/assignees", admin=True)
 def api_assignees(ctx):
-    """Suggestion list for the assign-to field: every name used before, plus staff."""
+    """Suggestion list for the assign-to field. `logins` are people with a staff
+    account — assigning to them makes the task appear in their portal."""
     con = ctx["con"]
+    logins = [r[0] for r in con.execute(
+        "SELECT name FROM users WHERE active = 1 ORDER BY name")]
     names = {r[0] for r in con.execute(
         "SELECT DISTINCT assigned_name FROM jobs WHERE assigned_name != ''")}
-    names |= {r[0] for r in con.execute("SELECT name FROM users WHERE active = 1")}
-    return {"assignees": sorted(names, key=str.lower)}
+    names |= set(logins)
+    return {"assignees": sorted(names, key=str.lower), "logins": logins}
 
 
 # ---------------------------------------------------------------- payments overview
 
-@route("GET", "/api/payments")
+@route("GET", "/api/payments", admin=True)
 def api_payments(ctx):
     con = ctx["con"]
     pending = [j for j in (job_row_dict(r) for r in con.execute(
@@ -541,12 +713,19 @@ def api_user_create(ctx):
     if con.execute("SELECT id FROM users WHERE LOWER(name) = LOWER(?)", (name,)).fetchone():
         raise ApiError(400, "A user with that name already exists")
     salt = db.new_salt()
-    con.execute(
+    cur = con.execute(
         "INSERT INTO users (name, pin_hash, salt, role) VALUES (?, ?, ?, ?)",
         (name, db.pin_hash(salt, str(body["pin"])), salt, role),
     )
+    # Jobs may already be assigned to this person by name from before they had a
+    # login. Link those now, so their portal isn't empty on day one.
+    adopted = con.execute(
+        """UPDATE jobs SET assigned_user_id = ?
+           WHERE assigned_user_id IS NULL AND LOWER(assigned_name) = LOWER(?)""",
+        (cur.lastrowid, name),
+    )
     con.commit()
-    return {"ok": True}
+    return {"ok": True, "adopted_jobs": adopted.rowcount}
 
 
 @route("PATCH", "/api/users/{id}", admin=True)
@@ -637,6 +816,17 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def _send_raw(self, raw):
+        self.send_response(200)
+        self.send_header("Content-Type", raw.mime)
+        self.send_header("Content-Length", str(len(raw.content)))
+        self.send_header("Cache-Control", "private, max-age=3600")
+        if raw.filename:
+            safe = re.sub(r'[^A-Za-z0-9._ -]', "_", raw.filename)
+            self.send_header("Content-Disposition", f'inline; filename="{safe}"')
+        self.end_headers()
+        self.wfile.write(raw.content)
+
     def _session_user(self, con):
         cookies = self.headers.get("Cookie", "")
         token = None
@@ -650,8 +840,8 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         if length <= 0:
             return {}
-        if length > 1_000_000:
-            raise ApiError(413, "Request too large")
+        if length > MAX_BODY_BYTES:
+            raise ApiError(413, "That file is too large")
         raw = self.rfile.read(length)
         try:
             data = json.loads(raw)
@@ -693,6 +883,8 @@ class Handler(BaseHTTPRequestHandler):
                 }
                 try:
                     result = fn(ctx)
+                    if isinstance(result, RawResponse):
+                        return self._send_raw(result)
                     return self._send_json(200, result, ctx.get("set_cookie"))
                 except ApiError as e:
                     return self._send_json(e.status, {"error": e.message})
